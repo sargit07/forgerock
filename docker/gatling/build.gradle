@@ -1,0 +1,65 @@
+plugins {
+    id "com.github.lkishalmi.gatling" version "3.3.4"
+}
+
+apply plugin: 'scala'
+apply plugin: 'java'
+apply plugin: 'idea'
+
+repositories {
+    jcenter()
+    mavenCentral()
+}
+
+dependencies {
+    gatling 'com.google.cloud:google-cloud-storage:1.96.0'
+    gatling 'org.zeroturnaround:zt-zip:1.13'
+    gatling 'com.lihaoyi:ujson_2.12:1.1.0'
+}
+
+gatling {
+    toolVersion = '3.1.2'
+    // These are lifted from the source code of gatling.sh
+    jvmArgs = [ '-server','-Xmx1G','-XX:+HeapDumpOnOutOfMemoryError','-XX:+UseG1GC',
+                '-XX:MaxGCPauseMillis=30','-XX:G1HeapRegionSize=16m','-XX:InitiatingHeapOccupancyPercent=75',
+                '-XX:+ParallelRefProcEnabled','-XX:+PerfDisableSharedMem','-XX:+OptimizeStringConcat',
+                '-Djava.net.preferIPv4Stack=true','-Djava.net.preferIPv6Addresses=false']
+    simulations = {
+        "**/*.scala"
+    }
+    //logLevel = "DEBUG"
+}
+
+task uploadLogs(type: JavaExec, dependsOn: compileGatlingScala) {
+    main = 'gsutil.LogUploader'
+    classpath = sourceSets.gatling.runtimeClasspath
+}
+
+task downloadLogs(type: JavaExec, dependsOn: compileGatlingScala) {
+    main = 'gsutil.LogDownloader'
+    classpath = sourceSets.gatling.runtimeClasspath
+}
+
+task buildReport(type: JavaExec, dependsOn: downloadLogs) {
+    main = 'io.gatling.app.Gatling'
+    classpath = sourceSets.gatling.runtimeClasspath
+    args = [
+            "-ro", "build/reports/downloadedLogs",
+            "-rf", ""
+    ]
+}
+
+task uploadReport(type: JavaExec, dependsOn: buildReport) {
+    main = 'gsutil.ReportUploader'
+    classpath = sourceSets.gatling.runtimeClasspath
+}
+
+task uploadResults(type: JavaExec) {
+    main = 'gsutil.ResultsUploader'
+    classpath = sourceSets.gatling.runtimeClasspath
+}
+
+task deleteLogs(type: JavaExec, dependsOn: uploadReport) {
+    main = 'gsutil.LogDeleter'
+    classpath = sourceSets.gatling.runtimeClasspath
+}

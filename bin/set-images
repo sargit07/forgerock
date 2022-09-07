@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+import tempfile
+from pathlib import Path
+import fileinput
+import os
+import json
+import argparse
+import textwrap
+import sys
+import re
+import shutil
+import logging
+
+import utils
+
+log = None
+
+#### NOTE: If you add a new product or repo, update the map below ####
+# This maps a repo prefix in a Dockerfile to a tag from the platform-images repo.
+REPO_TO_PLATFORM = {
+    # Example:
+    # The ds-empty image should use the ds.json file in platform-images to find the sha commit tag
+    'gcr.io/forgerock-io/ds-empty/pit1': 'ds',
+    'gcr.io/forgerock-io/ds/pit1': 'ds',
+    'gcr.io/forgerock-io/am-cdk/pit1': 'am',
+    # Amster commits are the same as am
+    'gcr.io/forgerock-io/amster/pit1': 'amster',
+    'gcr.io/forgerock-io/idm-cdk/pit1': 'idm',
+    'gcr.io/forgerock-io/ig/pit1': 'ig',
+}
+
+SCRIPT_DIR = Path(__file__)
+DEFAULT_REPO = 'ssh://git@stash.forgerock.org:7999/cloud/platform-images.git'
+DEFAULT_CONFIG_PATH = SCRIPT_DIR.joinpath(
+    '../../build/platform-images').resolve()
+
+# Dockerfiles requiring base image updates
+DOCKER_PRODUCTS = ('am', 'ig', 'idm', 'ds', 'amster')
+# Directory names in forgeops
+UI_PRODUCTS = ('admin-ui', 'end-user-ui', 'login-ui')
+# JSON key names in platform images
+UI_CONF_KEYNAME = ('imageNameAdmin', 'imageNameEnduser', 'imageNameLogin')
+# Other kustomize profiles
+MSC_PRODUCTS = ('rcs-agent',)
+# Product kustomize images
+KUSTOMIZE_PRODUCTS = ('admin-ui', 'end-user-ui', 'login-ui')
+PLATFORM_DOCKER_BASE = '../../docker'
+CLI_PRODUCTS = ('am', 'amster', 'ig', 'idm', 'ds', 'ui') + MSC_PRODUCTS
+PLATFORM_KUSTOMIZE_BASE = '../../kustomize/base'
+PLATFORM_DOCKER_PATH = SCRIPT_DIR.joinpath(PLATFORM_DOCKER_BASE).resolve()
+PLATFORM_KUSTOMIZE_PATH = SCRIPT_DIR.joinpath(
+    PLATFORM_KUSTOMIZE_BASE).resolve()
+DNS = re.compile(r'^([a-z0-9]+(-[a-z0-9]+)*\.)+[a-z]{2,}(:\d{1,})?$')
+
+HELP_EXAMPLES = """
+examples:
+# Checkout latest version of platform-images and update Dockerfiles to match it
+$ ./bin/set-images
+
+# Remove old config.
+$ ./bin/set-images --clean
+
+# Use a specific branch in platform-images
+$ ./bin/set-images --ref pit2-upgrade
+
+# Use a specific branch in platform-images and checkout exact commit
+$ ./bin/set-images --ref fdsf123
+
+# Use the given path to find the config and only change the am product.
+$ ./bin/set-images --config-path /tmp/mychange --products am
+
+# Update the dockerfile for AM to use the same repo and image but the tag of "sometagname"
+$ ./bin/set-images --inplace --products am --update-tag sometagname
+
+# Change all the repo names, leaves docker image name (leaves the last part as is) to match the value
+# Changes tags to match platform-images repository
+$ ./bin/set-images --update-repo us-docker.pkg.dev/forgeops-public/images
+"""
+
+### Tests ###
+_test_image_names = [
+    # tag with digest
+    ('library/busybox:latest@sha256:7cc4b5aefd1d0cadf8d97d4350462ba51c694ebca145b08d7d41b41acc8db5aa',
+     'library',
+     'busybox',
+     ':latest@sha256:7cc4b5aefd1d0cadf8d97d4350462ba51c694ebca145b08d7d41b41acc8db5aa',),
+    # just a tag
+    ('gcr.io/busybox:latest',
+     'gcr.io',
+     'busybox',
+     ':latest',),
+    # no tag
+    ('gcr.io:8080/my/namespace/busybox',
+     'gcr.io:8080/my/namespace',
+     'busybox',
+     ':latest',),
+    # with digest
+    ('gcr.io/busybox@sha256:7cc4b5aefd1d0cadf8d97d4350462ba51c694ebca145b08d7d41b41acc8db5aa',
+     'gcr.io',
+     'busybox',
+     '@sha256:7cc4b5aefd1d0cadf8d97d4350462ba51c694ebca145b08d7d41b41acc8db5aa',),
+    ('gcr.io/forgerock/am/pit1@sha256:7cc4b5aefd1d0cadf8d97d4350462ba51c694ebca145b08d7d41b41acc8db5aa',
+     'gcr.io/forgerock',
+     'am',
+     '@sha256:7cc4b5aefd1d0cadf8d97d4350462ba51c694ebca145b08d7d41b41acc8db5aa',),
+]
+
+_test_from_line = [
+    # FROM patterns
+    # FROM [--platform=<platform>] <image> [AS <name>]
+    # FROM [--platform=<platform>] <image>[:<tag>] [AS <name>]
+    # FROM [--platform=<platform>] <image>[@<digest>] [AS <name>]
+    ('FROM --platform=amd64 redis AS base',
+     'FROM --platform=amd64', 'redis', 'AS base'),
+    ('FROM redis AS base', 'FROM', 'redis', 'AS base'),
+    ('FROM redis', 'FROM', 'redis', ''),
+    ('FROM redis AS base', 'FROM', 'redis', 'AS base'),
+    ('FROM redis:latest AS base', 'FROM', 'redis:latest', 'AS base'),
+]
+
+
+def run_tests(args):
+    log.info('Testing image name parse.')
+    for tt in _test_image_names:
+        repo_name, image_name, tag_res = parse_repo_tag(tt[0])
+        if repo_name != tt[1] or image_name != tt[2] or tag_res != tt[3]:
+            log.critical(
+                f'Tests didn\'t pass {repo_name} {image_name} {tag_res} for {tt[0]}')
+            raise Exception
+    log.info('Testing from line parse.')
+    for tt in _test_from_line:
+        before, image, after = parse_from_line(tt[0])
+        if before != tt[1] or image != tt[2] or after != tt[3]:
+            log.critical(
+                f'Tests didn\'t pass {before} {image} {after} for {tt[0]}')
+            raise Exception
+    log.info('Tests have passed.')
+
+### END TESTS ###
+
+
+def func_args():
+    parser = argparse.ArgumentParser(
+        description='Modify ForgeRock platform base images.',
+        epilog=textwrap.dedent(HELP_EXAMPLES),
+        # Do not wrap description and epilog.
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    # Global
+    utils.add_loglevel_arg(parser)
+
+    # Git repo  configuration
+    parser.add_argument('--git-repo',
+                        help='Repository to pull configuration from.',
+                        default=DEFAULT_REPO)
+
+    parser.add_argument('--ref',
+                        help='Git reference to use: branch, commit, or tag'),
+    parser.add_argument('--branch-name',
+                        help='Deprecated, do not use.'),
+    parser.add_argument('--commit',
+                        help='Deprecated, do not use.'),
+    parser.add_argument('--force',
+                        help=('Remove existing git repo before using config'),
+                        default=False,
+                        action='store_true')
+
+    # Directory where image config should live
+    parser.add_argument('--config-path',
+                        help=('Path to configuration files. '
+                              'If the path exists the script will not clone a repo.'),
+                        default=DEFAULT_CONFIG_PATH,
+                        type=Path)
+
+    # Modification to config via the CLI
+    parser.add_argument('--update-repo',
+                        help=('Update repo for all base images. Useful for '
+                              'changing repo but maintaining the name of '
+                              'the image. Like skaffold --default-repo'))
+    parser.add_argument('--update-tag',
+                        help=('Update the tags of proucts to be <value>'))
+
+    # Limit changes to these products
+    parser.add_argument('--products',
+                        help=('Replace base images for given products.'),
+                        default=CLI_PRODUCTS,
+                        choices=CLI_PRODUCTS, nargs='+')
+
+    # Operations
+    parser.add_argument('--run-tests',
+                        help='Run validation tests against line/image parser.',
+                        action='store_true',
+                        default=False)
+
+    parser.add_argument('--clean',
+                        help=('Remove any existing Docker build configuration '
+                              'and quit.'),
+                        action='store_true',
+                        default=False)
+
+    parser.add_argument('--inplace',
+                        help=('Update the tag or repo for a product without '
+                              'loading a config file.'),
+                        action='store_true',
+                        default=False)
+    args = parser.parse_args()
+    global log
+    log = utils.logger('set-docker-image', args.log_level)
+    if args.branch_name or args.commit:
+        log.warning('Commit/Branch options now deprecated use --ref instead')
+        args.ref = args.commit if args.commit else args.branch_name
+    if args.inplace:
+        log.info('Updating files inplace. Not using any configuration')
+        func = run_from_args
+    elif args.run_tests:
+        log.info('Running tests.')
+        func = run_tests
+    elif args.clean:
+        log.info('Cleaning up.')
+        func = run_clean
+    else:
+        init_repo(args)
+        func = run_from_files
+    return func, args
+
+
+def parse_repo_tag(image):
+    """
+    Parse out the image and tag.
+    Leaves tag with either ':' or '@' in the tag name for preservation
+    <image> -> image,latest
+    <image>[:<tag>] -> image :tag
+    <image>[@<digest>] -> image @digest
+    """
+    try:
+        # split on the last '/' in the string
+        host_path, name_and_tag = image.rsplit('/', maxsplit=1)
+    except ValueError:
+        # am:latest || am
+        name_and_tag = image
+        host_path = ''
+
+    # Get tag or digest position
+    first_colon_position = name_and_tag.find(':')
+    at_position = name_and_tag.find('@')
+    # no tag or digest
+    if first_colon_position < 0:
+        name = name_and_tag
+        tag_or_digest = ':latest'
+    # There's an at position and it's before the first colon.
+    # This is:
+    #    name@digest
+    elif at_position > 0 and first_colon_position > at_position:
+        name = name_and_tag[:at_position]
+        tag_or_digest = name_and_tag[at_position:]
+    # We have a tag or a tag with a digest. Either way treat it the same
+    # This is:
+    #   name:latest
+    #   name:mytag@digest
+    else:
+        name = name_and_tag[:first_colon_position]
+        tag_or_digest = name_and_tag[first_colon_position:]
+
+    return host_path, name, tag_or_digest
+
+
+def parse_from_line(line):
+    """
+    Extract image name line uses FROM command
+    Returns 3 parts, one is a string up the image name, image name, string after image name
+    FROM [--platform=<platform>] <image> [AS <name>] ->
+        'FROM [--platform=<platform>]', '<image>', '[AS <name>]'
+    """
+    if not line.startswith('FROM '):
+        return '', '', ''
+    # FROM line may have a few forms, but all with ' '
+    # trash the first, because we don't need it it's FROM
+    before, *parts = line.split(' ', maxsplit=3)
+    after = ''
+    # trying to get the image:tag
+    image = ''
+    try:
+        if parts[0].startswith('--platform'):
+            before = f'{before} {parts[0]}'
+            image = parts[1]
+            image_pos = 1
+        else:
+            image = parts[0]
+            image_pos = 0
+    except IndexError:
+        log.warning(f'Potentially invalid FROM syntax in {line}',
+                    file=sys.stderr)
+        return '', '', ''
+    if len(parts) > image_pos:
+        after = ' '.join(parts[1+image_pos:])
+    return before, image, after
+
+
+def load_product_configs(path, product_names):
+    """
+    Loads product image configuration from json for the given product names.
+
+    A products configuration is expected to be at the root of path and should
+    be path/<product_name>.json
+    e.g. build/platform-images/am.json
+    """
+    docker_images = {}
+    kustomize_images = {}
+    for name in product_names:
+        try:
+            if name not in DOCKER_PRODUCTS:
+                # only add config for Dockerfile's only
+                continue
+            if name == 'amster':
+                filename = 'am.json'
+            else:
+                filename = f'{name}.json'
+            p = path.joinpath(filename)
+            if p.exists():
+                with p.open() as f:
+                    config = json.load(f)
+                docker_images[name] = config
+        except Exception as e:
+            log.error(f'Repo is invalid {name}, {p}')
+            log.error(f'{e}')
+            sys.exit(1)
+    try:
+        if 'ui' in product_names:
+            p = path.joinpath('ui.json')
+            if p.exists():
+                with p.open() as f:
+                    config = json.load(f)
+                for product_name, keyname in zip(UI_PRODUCTS, UI_CONF_KEYNAME):
+                    c = config.copy()
+                    c['imageName'] = config[keyname]
+                    kustomize_images[product_name] = c
+
+        if 'rcs-agent' in product_names:
+            p = path.joinpath('rcs-agent.json')
+            if p.exists():
+                with p.open() as f:
+                    config = json.load(f)
+                kustomize_images['rcs-agent'] = config
+
+        # amster images are all tagged with the same version as am-cdk.
+        # updating with forgeops-master doesn't use am base and am needs to be
+        # replaced
+        if 'amster' in product_names:
+            new_name = docker_images['amster']['imageName']
+            if 'am-cdk' in new_name:
+                new_name = new_name.replace('am-cdk', 'amster')
+            docker_images['amster']['imageName'] = new_name
+
+    except Exception as e:
+        log.error(f'Repo is invalid {p}')
+        log.error(f'{e}')
+        sys.exit(1)
+
+    return docker_images, kustomize_images
+
+
+def update_kustomize(products, kustomize_path, update_repo=None, update_tag=None):
+    """
+    Updates kustomization files to use image names and/or tags
+    update_repo and update_tag take precedence over product config.
+    """
+    for product_name, product_config in products.items():
+        kustomize_dir = kustomize_path.joinpath(product_name).resolve()
+        os.chdir(kustomize_dir)
+        new_image_name, new_tag = '', ''
+        if update_repo is not None:
+            new_image_name = f'{update_repo}/{product_name}'
+        else:
+            new_image_name = product_config['imageName']
+
+        # tag strings should start with ":" this makes it eastier to
+        # set the tag to be empty in case we are only changing a repo
+        if update_tag is not None:
+            new_tag = f':{update_tag}'
+        # if an update_repo operation set is set and update_tag isn't set
+        # then we don't change the tag and let it stay as defined in the
+        # kustomization.yaml
+        else:
+            new_tag = f':{product_config["imageTag"]}'
+        # Make sure that the image and tag have a value.
+        kustomize_set_image = f'.*{product_name}.*={new_image_name}{new_tag}'
+        log.info(f'Updating {kustomize_dir} to use {new_image_name}{new_tag}')
+
+        utils.run('kustomize',
+                  'edit',
+                  'set',
+                  'image',
+                  kustomize_set_image)
+
+
+def update_dockerfiles(products, dockerpath, update_repo=None, update_tag=None):
+    # Track files changed.
+    docker_files = dockerpath.rglob('**/Dockerfile')
+    # This makes an iterator that we just loop over and it handles all the file
+    # opening and closing for us.
+    # Anything "printed" to stdout is written to the file!
+    with fileinput.FileInput(files=docker_files, inplace=True) as f:
+        # Read each line of the file
+        for line in f:
+            before, image, after = parse_from_line(line)
+            # not a FROM command, write the content back.
+            # or we've already written to this file
+            if not image:
+                print(line, end='')
+                continue
+            # At this point we have a FROM line
+            # Now parse the current repo and tag
+            try:
+                current_repo, name, current_tag = parse_repo_tag(image)
+            except Exception:
+                log.error(f'Error {line} {f.filename()}')
+                sys.exit(1)
+
+            k = f'{current_repo}/{name}'
+            # Is the repo in repo to platform map?
+            if k in REPO_TO_PLATFORM:
+
+                # v is set to the product config.
+                # For example v='ds' means use the ds.json file from platform-images
+                v = REPO_TO_PLATFORM[k]
+
+                # If its not in the list of products - we can skip it
+                if v in products:
+                    if update_repo is not None or update_tag is not None:
+                        repo = k if update_repo is None else update_repo
+                        tag = current_tag if update_tag is None else update_tag
+                        new_image = f'{repo}:{tag}'
+                    else:
+                        product_config = products[v]
+                        new_image = f'{product_config["imageName"]}:{product_config["imageTag"]}'
+                    log.info(f'Updating {f.filename()} to use {new_image.strip()}')
+                    print(f'{before} {new_image}{after}')
+                    continue
+
+            print(line, end='')
+
+
+def init_repo(args):
+    """configure platform-images repository"""
+    # force - remove and re-setup
+    if args.force and args.config_path.is_dir():
+        run_clean(args)
+
+    if args.config_path != DEFAULT_CONFIG_PATH:
+        log.info(f'Using local directory at {args.config_path}')
+        return
+
+    log.info(f'Setting repo up in {args.config_path}.')
+
+    # use a shallow clone
+    if not args.ref:
+        utils.configure_platform_images(args.config_path,
+                                        repo=args.git_repo)
+    if args.ref:
+        utils.configure_platform_images(args.config_path,
+                                        ref=args.ref,
+                                        repo=args.git_repo)
+    # dump info from repo.
+    if args.git_repo != '' and args.config_path.is_dir():
+        _, commit_hash, err = utils.run('git',
+                                        'rev-parse',
+                                        'HEAD',
+                                        cwd=args.config_path,
+                                        cstdout=True, cstderr=True)
+        if err != b'':
+            log.error(f'Error when checking {args.config_path} {err.decode()}')
+            raise Exception
+        _, branch_name, err = utils.run('git',
+                                        'rev-parse',
+                                        '--abbrev-ref',
+                                        'HEAD',
+                                        cwd=args.config_path,
+                                        cstdout=True, cstderr=True)
+        if err != b'':
+            log.error(f'Error when checking {args.config_path} {err.decode()}')
+            raise Exception
+        log.info(
+            (f'Repo is at {commit_hash.decode().strip()} '
+             f'on branch {branch_name.decode().strip()}'))
+
+
+def run_clean(args):
+    try:
+        # Check to see if it's a repo.
+        if not args.config_path.joinpath('.git').is_dir() \
+                and args.config_path.is_dir():
+            log.error('Only git repos will be removed.')
+            return
+        shutil.rmtree(args.config_path)
+    except FileNotFoundError:
+        log.warning('Found nothing to clean.')
+
+
+def run_from_args(args):
+    if args.update_repo is None and args.update_tag is None:
+        log.critical(
+            'A tag or repo must be set to use inplace updates to files')
+        raise Exception
+    log.info('Updating products {}'.format(' '.join(args.products)))
+    if 'ui' in args.products:
+        cli_only = {k: dict() for k in UI_PRODUCTS}
+        # update repo or tag to '' to force a NOOP change on component
+        update_repo = args.update_repo if args.update_repo else ''
+        update_tag = args.update_tag if args.update_tag else ''
+        update_kustomize(cli_only,
+                         PLATFORM_KUSTOMIZE_PATH,
+                         update_repo=update_repo,
+                         update_tag=update_tag)
+
+    if 'rcs-agent' in args.products:
+        cli_only = {'rcs-agent': dict()}
+        # update repo or tag to '' to force a NOOP change on component
+        update_repo = args.update_repo if args.update_repo else ''
+        update_tag = args.update_tag if args.update_tag else ''
+        update_kustomize(cli_only,
+                         PLATFORM_KUSTOMIZE_PATH,
+                         update_repo=update_repo,
+                         update_tag=update_tag)
+
+    cli_only_docker = {k: dict()
+                       for k in args.products if k in DOCKER_PRODUCTS}
+    if len(cli_only_docker) > 0:
+        update_dockerfiles(cli_only_docker,
+                           PLATFORM_DOCKER_PATH,
+                           args.update_repo,
+                           args.update_tag)
+
+
+def run_from_files(args):
+    docker_images, kustomize_images = load_product_configs(args.config_path,
+                                                           args.products)
+    log.info('Updating products {}'.format(' '.join(args.products)))
+    update_dockerfiles(docker_images,
+                       PLATFORM_DOCKER_PATH,
+                       args.update_repo,
+                       args.update_tag)
+    update_kustomize(kustomize_images,
+                     PLATFORM_KUSTOMIZE_PATH,
+                     args.update_repo,
+                     args.update_tag)
+
+
+def main():
+    try:
+        func, args = func_args()
+        func(args)
+    except Exception:
+        import traceback
+        traceback.print_exc(file=sys.stdout)
+        sys.exit(1)
+    sys.exit(0)
+
+
+main()

@@ -1,0 +1,93 @@
+alertmanager:
+    enabled: true
+    ingress:
+        # Enable to use external url for Alertmanager.
+        enabled: false
+        pathType: Prefix
+        annotations:
+            kubernetes.io/ingress.class : nginx
+            cert-manager.io/cluster-issuer: default-issuer
+            nginx.ingress.kubernetes.io/ssl-redirect: "true"
+        hosts:
+          - alertmanager.iam.example.com
+        tls:
+          - secretName: sslcert
+            hosts:
+              - alertmanager.iam.example.com
+
+prometheus:
+    prometheusSpec:
+        serviceMonitorSelectorNilUsesHelmValues: false
+        ruleSelectorNilUsesHelmValues: false
+        enableAdminAPI: false
+        storageSpec:
+          volumeClaimTemplate:
+            metadata:
+              name: data
+            spec:
+              storageClassName: standard
+              accessModes: ["ReadWriteOnce"]
+              resources:
+                requests:
+                  storage: 100Gi
+    ingress:
+        # Enable to use external url for Prometheus.
+        enabled: false
+        pathType: Prefix
+        annotations:
+            kubernetes.io/ingress.class: nginx
+            cert-manager.io/cluster-issuer: default-issuer
+            nginx.ingress.kubernetes.io/ssl-redirect: "true"
+        hosts:
+          - prometheus.iam.example.com
+        tls:
+          - secretName: sslcert
+            hosts:
+              - prometheus.iam.example.com
+
+grafana:
+    enabled: true
+    adminPassword: password
+    # Enable to use external url for Grafana.
+    ingress:
+        enabled: false
+        pathType: Prefix
+        annotations:
+            kubernetes.io/ingress.class : nginx
+            cert-manager.io/cluster-issuer: default-issuer
+            nginx.ingress.kubernetes.io/ssl-redirect: "true"
+        hosts:
+          - grafana.iam.example.com
+        tls:
+          - secretName: sslcert
+            hosts:
+              - grafana.iam.example.com
+            
+prometheusOperator:
+    admissionWebhooks:
+      certManager:
+        enabled: true
+        issuerRef:
+          name: "default-issuer"
+          kind: "ClusterIssuer"
+
+defaultRules:
+    rules:
+        etcd: false
+        kubeApiserver: false
+        kubeScheduler: false
+        kubernetesSystem: false
+
+kubeScheduler:
+    enabled: false
+coreDns:
+    enabled: false
+kubeEtcd:
+    enabled: false
+kubeControllerManager:
+    enabled: false
+kubeProxy:
+    enabled: false
+kube-state-metrics:
+    podSecurityPolicy:
+        enabled: false

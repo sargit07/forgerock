@@ -1,0 +1,15 @@
+
+resources:
+- restored-data-pvc.yaml
+- ds-restore-job.yaml
+- ../backup-base
+
+commonLabels:
+  app: ds-restore
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+patchesStrategicMerge:
+- gsutil.yaml
+

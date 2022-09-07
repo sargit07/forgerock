@@ -1,0 +1,18 @@
+# Deploy the platform apps
+commonLabels:
+  app.kubernetes.io/part-of: "forgerock"
+resources:
+- ../../base/am-cdk
+- ../../base/idm-cdk
+- ../../base/end-user-ui
+- ../../base/login-ui
+- ../../base/admin-ui
+
+# Set the image to the dev images that are built every night
+images:
+- name: am
+  newName: us-docker.pkg.dev/forgeops-public/images/am
+  newTag: dev
+- name: idm
+  newName: us-docker.pkg.dev/forgeops-public/images/idm
+  newTag: dev

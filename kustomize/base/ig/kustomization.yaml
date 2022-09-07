@@ -1,0 +1,13 @@
+kind: ""
+apiversion: ""
+commonLabels:
+  app.kubernetes.io/name: ig
+  app.kubernetes.io/instance: ig
+  app.kubernetes.io/component: ig
+  app.kubernetes.io/part-of: forgerock
+  tier: middle
+  app: ig
+resources:
+- deployment.yaml
+- secret.yaml
+- service.yaml
